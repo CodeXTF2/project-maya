@@ -60,15 +60,16 @@ the same test, checked with `results/fc-split-tail4-trimmed.json`.
   directory. Incremental builds take a few minutes. Copy the exe aside after each build, because a running benchmark
   locks `strata.exe`.
 
-### Large files you may want to delete
-- `project-maya/build-hip/strata-*.exe`: 7 files of about 59 MB each, about 400 MB in total.
-- `maya-exp/results/ref-logsoftmax.bin`: about 230 MB, the reference for `score.py --ref`. Keep it if you will score
-  again with the same prompt.
-- `maya-exp/results/routes.0`: about 2 MB.
+### Large files (cleaned up 2026-10-12)
+Deleted once the campaign ended:
+- the experiment binaries `build-hip/strata-*.exe`;
+- the KL reference dump `maya-exp/results/ref-logsoftmax.bin` and the router-score logs `sc-*-scores.0` (re-create
+  them with `score.py --dump` and `STRATA_GLM_SCORE_LOG` if needed);
+- the Strata KL dumps and the downloaded v0.1.43 package;
+- the original Unsloth `mmproj-model-bf16.gguf` (the converted copy in `models/.../vision` is what Maya uses);
+- Strata's 0.1.39 engine backup.
 
-The logs are small.
-
----
+What remains in `maya-exp` (~90 MB) is the scripts, the patches and the small per-run logs and JSON results.
 
 ## 2. Understand the machine, the model and the engine first
 
@@ -615,8 +616,8 @@ accumulates over a long answer.
 - **Below rank 4 the gain flattens,** and at rank 2 MTP draft acceptance drops and eats the gain. That's the same
   knee as Maya.
 - **Rank 4 was locked in:**
-  - v0.1.43 installed in `Strata/engine`; the old engine is kept as `Strata/engine-0.1.39-backup`; the CPU
-    `strata-vision.exe` is carried over.
+  - v0.1.43 installed in `Strata/engine` (the 0.1.39 backup was later deleted; roll back by re-downloading that
+    release); the CPU `strata-vision.exe` is carried over.
   - `STRATA_ROUTE_TAIL_SKIP=4` added to `strata-swift-iq3_xxs.json`'s env; the old config is kept as
     `.bak-before-tailskip`.
   - Verified at 101.1 tok/s with the start-up line `STRATA_ROUTE_TAIL_SKIP=4 is ON`.

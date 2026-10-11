@@ -166,14 +166,18 @@ def tiers(m: dict, width: int):
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     vu, ru = n.get("vram_used") or 0, n.get("ram_used") or 0
     total = eng.get("experts") or max(1, vu + ru)
-    disk = max(0, total - vu - ru)
+    hu = min(int(n.get("host_used") or 0), max(0, total - vu - ru))   # the host cache (pageable RAM)
+    disk = max(0, total - vu - ru - hu)
     whole = max(total, vu + ru)                         # (the RAM tier can hold experts VRAM has too: never wider)
     cols = [round(width * vu / whole)]
     cols.append(min(width - cols[0], round(width * ru / whole)))
-    line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * max(0, width - sum(cols)), WARN))
+    cols.append(min(width - sum(cols), round(width * hu / whole)))
+    line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("▓" * cols[2], INFO_TEXT),
+                         ("█" * max(0, width - sum(cols)), WARN))
     legend = Table.grid(padding=(0, 1))
     for color, what, k, extra in ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
                                   (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"),
+                                  *(((INFO_TEXT, "RAM cache", hu, f" · {fmt(n.get('host_gb'), 1)} GB"),) if hu else ()),
                                   (WARN, "SSD only", disk, "")):
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))

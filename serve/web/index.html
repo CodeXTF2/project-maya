@@ -184,11 +184,13 @@
         <div class="tierbar" id="tierbar" aria-label="Experts by tier">
           <span class="tierbar__seg tierbar__seg--vram" id="tierbar-vram" style="width:0%"></span>
           <span class="tierbar__seg tierbar__seg--ram" id="tierbar-ram" style="width:0%"></span>
+          <span class="tierbar__seg tierbar__seg--host" id="tierbar-host" style="width:0%"></span>
           <span class="tierbar__seg tierbar__seg--disk" id="tierbar-disk" style="width:0%"></span>
         </div>
         <div class="tierlegend">
           <div class="tierlegend__item"><i class="dot dot--vram"></i><span>VRAM</span><b id="tier-vram-text">&ndash;</b></div>
           <div class="tierlegend__item"><i class="dot dot--ram"></i><span>Pinned RAM</span><b id="tier-ram-text">&ndash;</b></div>
+          <div class="tierlegend__item" id="tier-host-item" hidden><i class="dot dot--host"></i><span>RAM cache</span><b id="tier-host-text">&ndash;</b></div>
           <div class="tierlegend__item"><i class="dot dot--disk"></i><span>SSD only</span><b id="tier-disk-text">&ndash;</b></div>
         </div>
         <div class="metrics metrics--tiers" id="tiers"></div>

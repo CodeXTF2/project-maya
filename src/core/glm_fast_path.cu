@@ -346,9 +346,83 @@ static void numa_pinned_free(void* p, size_t bytes) {
 
 namespace glmfast {
 
+// The HOST CACHE (STRATA_GLM_HOST_CACHE=1, or _GB=<n> for a fixed size): the RAM the pinned tier cannot take, as
+// Strata's resident mode keeps it (STRATA_RESIDENT_PIN=0) - pageable memory, locked where the OS allows, never
+// registered with the GPU, so the driver's limit on pinned memory does not cap it (Windows: a GPU pins about half
+// the RAM - an RX 7900 XTX with 64 GB stopped at a ~30 GB tier while 25 GB more stood free).  It holds the hottest
+// experts after the tiers, filled once by fast_warm, and serves read_slice's reads of them with a memcpy instead of
+// the SSD; everything above read_slice (the tiers, the CPU lane, prompts) is unchanged.  Read-only once ready.
+struct HostCacheEnt {
+    uint64_t off;
+    size_t len;
+    const uint8_t* p;
+};
+static std::vector<std::pair<const Glm5Model::Shard*, std::vector<HostCacheEnt>>> g_hc;   // each sorted by off
+static uint8_t* g_hc_base = nullptr;
+static size_t g_hc_bytes = 0;
+static int64_t g_hc_experts = 0;
+static std::atomic<bool> g_hc_ready{false};
+static std::atomic<uint64_t> g_hc_hits{0};
+
+static bool host_cache_read(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst) {
+    if (!g_hc_ready.load(std::memory_order_acquire)) return false;
+    for (const auto& s : g_hc) {
+        if (s.first != &sh) continue;
+        auto it = std::upper_bound(s.second.begin(), s.second.end(), off,
+                                   [](uint64_t o, const HostCacheEnt& e) { return o < e.off; });
+        if (it == s.second.begin()) return false;
+        --it;
+        if (off + len > it->off + it->len) return false;
+        std::memcpy(dst, it->p + (off - it->off), len);
+        g_hc_hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+static void host_cache_free() {
+    g_hc_ready.store(false, std::memory_order_release);
+    g_hc.clear();
+    if (g_hc_base == nullptr) return;
+#ifdef _WIN32
+    VirtualFree(g_hc_base, 0, MEM_RELEASE);
+#elif defined(__linux__)
+    munmap(g_hc_base, g_hc_bytes);
+#else
+    std::free(g_hc_base);
+#endif
+    g_hc_base = nullptr;
+    g_hc_bytes = 0;
+    g_hc_experts = 0;
+}
+
+// pageable memory for the host cache, locked when the OS lets it (a failed lock only warns: Windows may then page
+// some of it out under pressure, and those reads cost a page fault instead of an SSD read); nullptr on failure
+static uint8_t* host_cache_alloc(size_t bytes, bool& locked) {
+    locked = false;
+#ifdef _WIN32
+    void* p = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p == nullptr) return nullptr;
+    SIZE_T mn = 0, mx = 0;
+    const HANDLE proc = GetCurrentProcess();
+    if (GetProcessWorkingSetSize(proc, &mn, &mx) &&
+        SetProcessWorkingSetSize(proc, mn + bytes + ((SIZE_T) 64 << 20), mx + bytes + ((SIZE_T) 64 << 20)))
+        locked = VirtualLock(p, bytes) != 0;
+    return (uint8_t*) p;
+#elif defined(__linux__)
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    locked = mlock(p, bytes) == 0;
+    return (uint8_t*) p;
+#else
+    return (uint8_t*) std::malloc(bytes);
+#endif
+}
+
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
 // direct fd (no page cache), a buffered pread otherwise, the mapping as the last resort
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst) {
+    if (host_cache_read(sh, off, len, dst)) return;
 #ifndef _WIN32
     if (sh.fd_direct >= 0) {
         // freed when its thread ends
@@ -2038,6 +2112,102 @@ bool Glm5Model::fast_warm(std::string& err) {
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "glm fast: CUDA%d tiers warm: %zu experts (%.1f GB) in %.0f s (%.2f GB/s)\n", dev_, jobs.size(),
                  (double) total_bytes / 1e9, s, (double) total_bytes / 1e9 / std::max(1e-9, s));
+
+    // ---- the host cache (glmfast::g_hc): the next experts in each layer's order after the tiers, round-robin over
+    // the layers, into the RAM left after the headroom (or STRATA_GLM_HOST_CACHE_GB).  One GPU only: a split's parts
+    // warm one after another and would each size it from what the last one left
+    const char* hcv = getenv("STRATA_GLM_HOST_CACHE");
+    const char* hcg = getenv("STRATA_GLM_HOST_CACHE_GB");
+    if (((hcv != nullptr && std::atoi(hcv) != 0) || hcg != nullptr) && !F->ram_resident) {
+        if (n_parts_ != 1) {
+            std::fprintf(stderr, "glm fast: CUDA%d the host cache is for one GPU: off on this split\n", dev_);
+            return true;
+        }
+        double head_gb = F->unified_memory ? 16.0 : 6.0;
+        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const int64_t free_b = avail_ram_now();
+        int64_t budget = hcg != nullptr ? (int64_t) (std::atof(hcg) * 1073741824.0)
+                                        : free_b - (int64_t) (head_gb * 1073741824.0);
+        if (hcg != nullptr && free_b > 0)   // a fixed size still leaves the headroom
+            budget = std::min<int64_t>(budget, free_b - (int64_t) (head_gb * 1073741824.0));
+        struct HJob {
+            int il, e;
+            size_t at;   // offset in the cache
+        };
+        std::vector<HJob> hj;
+        size_t used = 0;
+        for (bool progress = budget > 0; progress;) {
+            progress = false;
+            for (int il = l0_; il < lt_; ++il) {
+                if (!F->L[(size_t) il].moe || next[(size_t) il] >= g.n_expert) continue;
+                const size_t blob = F->L[(size_t) il].blob;
+                if ((int64_t) (used + blob) > budget) continue;
+                hj.push_back(HJob{il, order[(size_t) il][(size_t) next[(size_t) il]++], used});
+                used += blob;
+                progress = true;
+            }
+        }
+        if (hj.empty()) {
+            std::fprintf(stderr, "glm fast: CUDA%d host cache: no room (%.1f GB free, %.0f GB headroom) or every "
+                                 "expert is in the tiers\n", dev_, (double) free_b / 1073741824.0, head_gb);
+            return true;
+        }
+        bool locked = false;
+        uint8_t* base = glmfast::host_cache_alloc(used, locked);
+        if (base == nullptr) {
+            std::fprintf(stderr, "glm fast: CUDA%d host cache: %.1f GB did not allocate - off\n", dev_,
+                         (double) used / 1073741824.0);
+            return true;
+        }
+        const auto h0 = std::chrono::steady_clock::now();
+        for (size_t b = 0; b < hj.size(); b += 8) {
+            const int nb = (int) std::min<size_t>(8, hj.size() - b);
+            F->workers->run(nb * 3, [&](int job) {
+                const HJob& J = hj[b + (size_t) (job / 3)];
+                const int role = job % 3;
+                const auto& Ly = F->L[(size_t) J.il];
+                const auto& nl = pack_layers_[(size_t) J.il];
+                const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
+                const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
+                                     : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
+                                                 : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
+                const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+                read_slice(sh, off, len, base + J.at + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes));
+            });
+        }
+        // the lookup: each expert's three slices under their shard, sorted by offset
+        for (const HJob& J : hj) {
+            const auto& Ly = F->L[(size_t) J.il];
+            const auto& nl = pack_layers_[(size_t) J.il];
+            for (int role = 0; role < 3; ++role) {
+                const Shard* sh = &pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
+                const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
+                                     : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
+                                                 : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
+                const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+                const uint8_t* p = base + J.at + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes);
+                auto it = std::find_if(glmfast::g_hc.begin(), glmfast::g_hc.end(),
+                                       [sh](const auto& x) { return x.first == sh; });
+                if (it == glmfast::g_hc.end()) {
+                    glmfast::g_hc.push_back({sh, {}});
+                    it = glmfast::g_hc.end() - 1;
+                }
+                it->second.push_back(glmfast::HostCacheEnt{off, len, p});
+            }
+        }
+        for (auto& x : glmfast::g_hc)
+            std::sort(x.second.begin(), x.second.end(),
+                      [](const glmfast::HostCacheEnt& a, const glmfast::HostCacheEnt& b) { return a.off < b.off; });
+        glmfast::g_hc_base = base;
+        glmfast::g_hc_bytes = used;
+        glmfast::g_hc_experts = (int64_t) hj.size();
+        glmfast::g_hc_ready.store(true, std::memory_order_release);
+        const double hs = std::chrono::duration<double>(std::chrono::steady_clock::now() - h0).count();
+        std::fprintf(stderr, "glm fast: CUDA%d host cache: %zu more experts (%.2f GB) in pageable RAM%s, %.0f s - "
+                             "%.0f GB headroom left of %.1f GB free\n", dev_, hj.size(), (double) used / 1073741824.0,
+                     locked ? ", locked" : " (NOT locked: Windows may page some of it out)", hs, head_gb,
+                     (double) free_b / 1073741824.0);
+    }
     return true;
 }
 
@@ -2055,6 +2225,7 @@ void Glm5Model::fast_destroy() {
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
     F->workers.reset();
+    glmfast::host_cache_free();
     F->cpu_pool.reset();
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
@@ -2252,6 +2423,10 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
             s.ram_slots += R.n;
             for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew;
         }
+    }
+    if (glmfast::g_hc_ready.load(std::memory_order_acquire)) {
+        s.host_used = glmfast::g_hc_experts;
+        s.host_gb = (double) glmfast::g_hc_bytes / 1073741824.0;
     }
     if (fast_ != nullptr) {
         s.tokens = fast_->tokens;

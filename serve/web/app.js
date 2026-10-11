@@ -292,9 +292,14 @@ function renderTiers(t, eng) {
   }
   const vu = n.vram_used || 0, ru = n.ram_used || 0;
   const total = (eng && eng.experts) || Math.max(1, vu + ru);
-  const disk = Math.max(0, total - vu - ru);
+  // the host cache (pageable RAM, filled at start): some of its experts may since have moved into the tiers too
+  const hu = Math.min(n.host_used || 0, Math.max(0, total - vu - ru));
+  const disk = Math.max(0, total - vu - ru - hu);
   $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
   $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
+  $("tierbar-host").style.width = `${(100 * hu) / total}%`;
+  $("tier-host-item").hidden = !n.host_used;
+  $("tier-host-text").textContent = `${fmt(n.host_used || 0)} experts · ${fmt(n.host_gb, 1)} GB`;
   $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
   $("tier-vram-text").textContent = `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
   $("tier-ram-text").textContent = `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;

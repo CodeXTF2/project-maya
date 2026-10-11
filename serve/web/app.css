@@ -135,12 +135,13 @@ main { min-height: 0; min-width: 0; display: flex; }
 .tierbar__seg { display: block; height: 100%; transition: width 400ms var(--st-ease); min-width: 0; }
 .tierbar__seg--vram { background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, var(--st-accent-2))); }
 .tierbar__seg--ram { background: var(--st-info); opacity: .85; }
+.tierbar__seg--host { background: var(--st-info); opacity: .45; }
 .tierbar__seg--disk { background: var(--st-warn); opacity: .7; }
 .tierlegend { display: flex; flex-wrap: wrap; gap: var(--st-s-6); font-size: var(--st-fs-sm); }
 .tierlegend__item { display: flex; align-items: center; gap: 8px; color: var(--st-ink-muted); }
 .tierlegend__item b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
 .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-.dot--vram { background: var(--st-accent); } .dot--ram { background: var(--st-info); } .dot--disk { background: var(--st-warn); }
+.dot--vram { background: var(--st-accent); } .dot--ram { background: var(--st-info); } .dot--host { background: var(--st-info); opacity: .45; } .dot--disk { background: var(--st-warn); }
 
 /* ---------------------------------------------------------------- monitor: metric grids */
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }

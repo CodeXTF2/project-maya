@@ -119,6 +119,8 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        int64_t host_used = 0;   // the host cache (STRATA_GLM_HOST_CACHE): experts in pageable RAM, off the GPU's pin limit
+        double host_gb = 0;
     };
     FastStats fast_stats() const;
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed

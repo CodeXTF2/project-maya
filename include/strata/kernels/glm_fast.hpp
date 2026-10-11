@@ -218,6 +218,7 @@ struct MoeResponse {
     int upd_key[64];
     unsigned long long upd_val[64];
     int cpu;                          // 1: cpu_part (host-mapped, below) holds the missed experts' weighted sum
+    unsigned int skip_mask;           // DISK LANE: plan entries the host computed (cpu_part): the device skips them
     float cpu_part[4096];
 };
 /// Router (sigmoid + bias, stable top-k, normalised weights - router_sigmoid's arithmetic), the plan

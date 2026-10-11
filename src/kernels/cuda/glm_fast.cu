@@ -2218,7 +2218,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     __syncthreads();
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
-    if (s_cpu != 0u)
+    if (s_cpu != 0u || s_mask != 0u)   // (the disk lane computes disk-only experts on the host too)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
     if (tid == 0) {
         rq->layer = a.layer;
@@ -2275,6 +2275,12 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
     // fetch kernel copies it into the slot the route already planned
     const unsigned int pm = ((volatile const MoeResponse*) r)->ptr_mask;
     if (tid < 8 && (pm >> tid) & 1u) d.fetch_src[tid] = ((volatile const MoeResponse*) r)->ptr[tid];
+    const unsigned int sk = ((volatile const MoeResponse*) r)->skip_mask;
+    if (tid < 8 && (sk >> tid) & 1u) {   // the DISK LANE computed it on the host (cpu_part): no fetch, no expert run
+        d.plan_ptr[tid] = 0ull;
+        d.fetch_src[tid] = 0ull;
+        if (d.defer_ptr != nullptr) d.defer_ptr[tid] = 0ull;
+    }
     const int nu = ((volatile const MoeResponse*) r)->n_upd;
     for (int u = tid; u < nu && u < 64; u += blockDim.x)
         d.tab[((volatile const MoeResponse*) r)->upd_key[u]] = ((volatile const MoeResponse*) r)->upd_val[u];

@@ -792,6 +792,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->split_moe = true;
         std::fprintf(stderr, "glm fast: CUDA%d split MoE on (disk-only experts in a second pass)\n", dev_);
     }
+    if (const char* v = getenv("STRATA_GLM_DISK_LANE"); v != nullptr && std::atoi(v) != 0) F->disk_lane = true;
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
@@ -2284,6 +2285,9 @@ void Glm5Model::fast_destroy() {
                      dev_, (double) F->pred_overlap.load() / (double) F->pred_n.load(),
                      100.0 * (double) F->pred_miss_hit.load() / (double) std::max<uint64_t>(1, F->pred_miss.load()),
                      (unsigned long long) F->pred_miss.load());
+    if (F->disk_lane)
+        std::fprintf(stderr, "glm fast diag CUDA%d: disk lane %llu experts on the CPU in %.1f s\n", dev_,
+                     (unsigned long long) F->dlane_experts.load(), (double) F->dlane_us.load() / 1e6);
     std::fprintf(stderr, "glm fast diag CUDA%d: disk reads %llu (%.1f s), host-cache slice hits %llu\n", dev_,
                  (unsigned long long) F->disk_reads.load(), (double) F->disk_us.load() / 1e6,
                  (unsigned long long) glmfast::g_hc_hits.load());
@@ -2557,6 +2561,7 @@ void Glm5Model::fast_service() {
                 }
             }
             uint64_t nh = 0;
+            int promo_spare[8] = {-1, -1, -1, -1, -1, -1, -1, -1};   // DISK LANE: the spare a promotion took
             for (int i = 0; i < K; ++i) {
                 const int key = il * g.n_expert + ids[i];
                 if (F->cnt[(size_t) key] < (1u << 24)) ++F->cnt[(size_t) key];
@@ -2580,7 +2585,10 @@ void Glm5Model::fast_service() {
                         P.tick[(size_t) s] = F->clock;
                         F->slot_of[(size_t) key] = s;
                         for (int j = 0; j < gf::kSpares; ++j)
-                            if (P.spare[j] == s) P.spare[j] = -1;
+                            if (P.spare[j] == s) {
+                                P.spare[j] = -1;
+                                promo_spare[i] = j;
+                            }
                         F->promotions.fetch_add(1, std::memory_order_relaxed);
                     }
                     // exclusive tiers: its RAM copy is released at the next boundary (the fetch reads it now)
@@ -2645,6 +2653,32 @@ void Glm5Model::fast_service() {
                 //      one the LOOKAHEAD already read (or is reading) is answered from its RAM slot
                 const auto t0 = std::chrono::steady_clock::now();
                 const int cls = F->layer_rc[(size_t) il];
+                // DISK LANE: the CPU computes this route's disk-only experts from where they land (RAM tier or
+                // staging) - no PCIe copy; an expert the route promoted gives its spare back (it stays in the RAM
+                // tier, and a later route promotes it from there)
+                const bool dlane = F->disk_lane && F->cpu_ans_h != nullptr && F->cpu_fmt[(size_t) il].n_ff > 0;
+                int n_dupd = 0, dupd_key[2 * 8];
+                unsigned long long dupd_val[2 * 8];
+                unsigned int promo_m = promo;
+                if (dlane) {
+                    for (int i = 0; i < K; ++i) {
+                        if ((((miss & promo_m) >> i) & 1u) == 0) continue;
+                        const int key = il * g.n_expert + ids[i];
+                        const int s = P.slot_index(rq->promo_ptr[i]);
+                        if (s >= 0 && s < P.n && promo_spare[i] >= 0) {
+                            P.st[(size_t) s] = FastState::kSpare;
+                            P.key[(size_t) s] = -1;
+                            P.spare[promo_spare[i]] = s;
+                            F->slot_of[(size_t) key] = -1;
+                            dupd_key[n_dupd] = (int) F->tab_key((size_t) key);
+                            dupd_val[n_dupd++] = 0ull;
+                            dupd_key[n_dupd] = (int) F->spare_key(il, promo_spare[i]);
+                            dupd_val[n_dupd++] = (unsigned long long) P.slot_ptr(s);
+                            F->promotions.fetch_sub(1, std::memory_order_relaxed);
+                            promo_m &= ~(1u << i);
+                        }
+                    }
+                }
                 int nm = 0, mi[8], nr = 0, rd[8], nw = 0, wt[8], ns = 0, sl[8];
                 uint64_t stv[8];
                 uint8_t* dst[8];
@@ -2668,7 +2702,7 @@ void Glm5Model::fast_service() {
                             }
                             ++F->ah_used;
                         }
-                        if ((promo >> mi[m]) & 1u) {   // promoted: a pure staging use, freed at the boundary
+                        if ((promo_m >> mi[m]) & 1u) {   // promoted: a pure staging use, freed at the boundary
                             R.st[(size_t) rs] = FastState::kRRelease;
                             R.key[(size_t) rs] = -1;
                             F->ram_of[(size_t) key] = -1;
@@ -2705,10 +2739,10 @@ void Glm5Model::fast_service() {
                     if (rs >= 0) {
                         R.key[(size_t) rs] = key;
                         R.tick[(size_t) rs] = F->clock;
-                        R.st[(size_t) rs] = ((promo >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
-                        F->ram_of[(size_t) key] = ((promo >> mi[m]) & 1u) ? -1 : rs;
+                        R.st[(size_t) rs] = ((promo_m >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
+                        F->ram_of[(size_t) key] = ((promo_m >> mi[m]) & 1u) ? -1 : rs;
                         dst[m] = R.base + (size_t) rs * R.stride;
-                        if ((promo >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
+                        if ((promo_m >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
                     } else {
                         dst[m] = F->stage[(size_t) m];
                     }
@@ -2738,9 +2772,31 @@ void Glm5Model::fast_service() {
                 Rp->ptr_mask = 0;
                 Rp->n_upd = 0;
                 Rp->cpu = 0;
-                for (int m = 0; m < nm; ++m) {
-                    Rp->ptr[mi[m]] = (unsigned long long) dst[m];
-                    Rp->ptr_mask |= 1u << mi[m];
+                Rp->skip_mask = 0;
+                if (dlane && nm > 0) {
+                    const uint8_t* blob[8];
+                    float w[8];
+                    for (int m = 0; m < nm; ++m) {
+                        blob[m] = dst[m];
+                        w[m] = rq->w[mi[m]];
+                        Rp->skip_mask |= 1u << mi[m];
+                    }
+                    const auto tc = std::chrono::steady_clock::now();
+                    fast_cpu_experts(il, nm, blob, w, rq->x, Rp->cpu_part);
+                    F->dlane_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                              std::chrono::steady_clock::now() - tc).count(), std::memory_order_relaxed);
+                    F->dlane_experts.fetch_add((uint64_t) nm, std::memory_order_relaxed);
+                    Rp->cpu = 1;
+                    for (int u = 0; u < n_dupd; ++u) {
+                        Rp->upd_key[u] = dupd_key[u];
+                        Rp->upd_val[u] = dupd_val[u];
+                    }
+                    Rp->n_upd = n_dupd;
+                } else {
+                    for (int m = 0; m < nm; ++m) {
+                        Rp->ptr[mi[m]] = (unsigned long long) dst[m];
+                        Rp->ptr_mask |= 1u << mi[m];
+                    }
                 }
                 std::atomic_thread_fence(std::memory_order_release);
                 Rp->seq = next;

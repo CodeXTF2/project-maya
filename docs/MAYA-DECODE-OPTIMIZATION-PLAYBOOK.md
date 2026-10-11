@@ -417,6 +417,160 @@ The HIP installer turns images off. What was needed:
 Measured: a 448x448 picture encodes to 256 tokens in 1.7 s on the CPU. End to end, the server described the test
 picture correctly in 15 s.
 
+## 6d. Round 3 (2026-10-12): the VRAM cache policy itself - research and offline bounds
+
+### 6d.1 Why look at the policy at all
+After round 2 the decode is bound by bytes into VRAM: PCIe pulls take ~44% of a token and the VRAM hit rate is ~61%.
+Before inventing policies, I measured how far the current policy is from the theoretical ceiling, using the route
+logs we already had.
+
+### 6d.2 Offline bounds (`maya-exp/vram_policy_bound.py`, `lrfu_sweep.py`, `spare_gap.py`)
+Two recorded runs of 460 tokens each (the short and the long prompt), 36 VRAM slots per layer, warm-started from the
+usage profile as the engine is:
+
+| Policy | Hit rate |
+|---|---|
+| Engine, measured live (same run, no tail skip) | **42.5%** |
+| LRU | 50-51% |
+| Ideal version of the engine's LFU (aged counts) | 49-51% |
+| LFU + TinyLFU-style admission (cache a miss only if its count beats the victim's) | 40-44% (worse) |
+| Best recency/frequency blend (LRFU, half-life ~16 tokens) | 52-54% |
+| **Belady optimum** (knows the future) | **69-70%** |
+| Belady with optional caching of misses | 70-71% |
+
+At 72 slots per layer: LRU 67%, LFU 64-67%, Belady 82-83%.
+
+**Readings:**
+- **About 8 points are lost in the engine's implementation, not its policy** (42.5% live vs 51% for the ideal LFU on
+  the same accesses). The 3-promotions-per-layer-per-token spare limit explains only ~1 point (`spare_gap.py`).
+  Remaining suspects:
+  - experts the CPU lane computes are never promoted;
+  - slots stay blocked while a demoted expert copies out (until the next token);
+  - spare and prompt-reserve slots reduce the real capacity below 36.
+- **About 16 points separate the best history-only policy from the optimum.** Only a predictive signal can close
+  that gap.
+- **LRU ties LFU, and a decay half-life of ~16 tokens is best,** so the access pattern drifts noticeably within an
+  answer.
+- **Admission filtering based on counts hurts here,** because newcomers are often what the next tokens need. Optional
+  caching gives even the optimum under 1 point. The gap is about *which experts we evict*, not *what we admit*.
+
+### 6d.3 Literature survey (summary)
+- **ARC, LIRS, 2Q, CLOCK-Pro, S3-FIFO, SIEVE, TinyLFU, GL-Cache:** built for one-hit wonders, scans and huge item
+  counts. This workload has 288 items per layer, all recurring, so these converge toward LFU. Not worth implementing.
+- **Learned Belady imitation:** Hawkeye, Glider and Mockingjay (CPU last-level caches), LRB (CDNs), Parrot, and
+  FlashMoE (MoE, a small MLP per layer). These are the right shape for the problem.
+- **MoE systems with the strongest hit-rate gains use the router's full probability distributions, not just the
+  selections:** FineMoE (+39%), SeqMoE (84.6% vs LRU's 60.0% at 15% capacity, using forecast probabilities with
+  Belady), ExpertFlow (+15-36% over LRU). These gains are measured against LRU, and our LFU already beats LRU.
+- **Theory:**
+  - Under a stationary independent-reference model, keeping the top-k items by true probability is optimal, and LFU
+    converges to it.
+  - With drift, the problem becomes *estimating* each probability, and an EMA is the steady-state Kalman filter.
+  - Full router scores lower the observation noise, which allows faster tracking without extra variance.
+- **Changing the routing** (cache-conditional routing, router fine-tuning) gives the largest gains, but changes
+  outputs. Our tail skip is already in that family; substitution lost to skipping (section 6.2).
+
+### 6d.4 Plan for this round
+1. Pass all 288 router scores per layer to the host. Log them with `STRATA_GLM_SCORE_LOG`, alongside the route log's
+   tier masks.
+2. Offline, replay:
+   - score-based predictors and eviction policies against LFU, LRFU and Belady;
+   - the engine's mechanics, to find where its ~8 points go.
+3. Implement what wins and A/B it against the current best state.
+
+### 6d.5 Result: router scores barely help, and the gap is mostly unpredictable
+I logged two runs of 512 tokens each (short and long prompt; tail skip off so the logs show the model's own routing)
+with `STRATA_GLM_SCORE_LOG` (all 288 router probabilities per layer per token) and the route log. The replay is
+`maya-exp/score_policy.py`: train on one log, test on the other. Hit rates at 36 slots:
+
+| Predictor | Hit rate |
+|---|---|
+| LFU (ours) | 51.8-52.8% |
+| LRFU, 16-token half-life | 53.5-53.9% |
+| EMA of the margin to the 8th-place cut-off (biased score) | 49.6-52.6% |
+| Calibrated P(selected next \| rank) | 52.5-53.5% |
+| Linear model on score and recency features | **53.6-54.3%** |
+| Belady optimum | 69.3-69.8% |
+
+**Pitfall to remember:** GLM selects by `sigmoid + per-expert bias` (`blk.N.exp_probs_b.bias`, range 5-14.5), and
+the bias dominates the sigmoid's 0-1 range. My first replay ranked by the raw sigmoid and made scores look harmful
+(46-50%). Always reproduce the *exact* selection rule before judging a signal.
+
+**Splitting the gap** (`oracle_split.py`), on the long-prompt log:
+- Best online policy: 53.9%.
+- Oracle knowing each expert's true local rate over +-16 tokens: 63.7%.
+- Belady optimum: 69.8%.
+
+So about 10 points need foresight of how routing drifts over the next ~16 tokens, and about 6 points are the
+randomness of which experts get drawn, which nothing can predict. The current router state recovers only ~1.5 of the
+10. **Conclusion:** history plus router state is nearly exhausted as a lossless signal. The published MoE gains are
+measured against LRU, which our LFU already beats.
+
+### 6d.6 Result: the engine's own mechanics lose ~7 points (`engine_gap.py`, `spares_sweep.py`)
+Replaying the same accesses with the engine's mechanics switched on one at a time:
+
+| Step | Hit rate |
+|---|---|
+| Ideal LFU, 36 slots | 52.8% |
+| + 3 slots kept empty as spares (33 usable) | 51.1% |
+| + at most 3 promotions per layer per token | 48.9% |
+| + CPU-lane experts not promoted | 48.9% (no effect) |
+| Live engine | 45.8% (≈ 3 more slots blocked: demotions copying out, prompt reserve) |
+
+Sweeping the spare count:
+
+| Spares per layer | Hard spares (kept empty) | Soft spares (victim stays cached until claimed) |
+|---|---|---|
+| 3 (today) | 48.9% | 50.8% |
+| 5 | 49.5% | 52.5% |
+| 6 | 49.1% | 52.7% |
+
+**Next: soft spares.** The boundary nominates victims that stay resident, and their copy to RAM starts at once. A
+promotion claims one by invalidating the victim's table entry (never a victim this route itself selected). The
+layer's fetch waits on that layer's copy-out event.
+- Expected: about +4 points of VRAM hit from the spares alone, plus part of the ~3 points blocked by demotions in
+  flight.
+
+### 6d.7 Soft spares, implemented (`STRATA_GLM_SOFT_SPARES=<n>`, branch `exp/score-cache`)
+**Design:**
+- The table holds 6 spare entries per layer plus a victim-key region (`kSpares` 6). Every pool-sizing rule still
+  counts the hard 3 (`kHardSpares`).
+- At the boundary, the coldest non-nominated resident is nominated. It stays resident, and its RAM shadow copy
+  (`kRShadow`) starts at once on the copy stream; one event per layer marks the copies done.
+- A promotion claims a spare by zeroing the victim's VRAM table entry. It never claims a victim the same route
+  selected. The host then makes the shadow live (`kRNew` → `kRHold`).
+- The layer's fetch waits on that layer's copy-out event.
+- Nominations are withdrawn before the pool lends its tail to a prompt or the vision encoder.
+
+**Results:**
+
+| Arm (same binary) | Short prompt | Long prompt | VRAM hit | Waits/token |
+|---|---|---|---|---|
+| Best state (base) | 11.49, 11.64 tok/s | 10.61 (earlier 10.80-11.39) | 61.3-61.5% | 22.8-23.5 |
+| + soft spares 6 | 11.27, 11.25 tok/s | 11.08 | **65.9%** | 19.7-20.2 |
+| + soft spares 4 | 11.29 tok/s | - | 65.2% | 19.9 |
+
+- Quality: teacher-forced KL 0.0058, the same as split MoE alone, so it's exact.
+- Teacher-forced speed without tail skip: 159.5 vs ~161-162 ms/token (+1.5%).
+
+**Reading:** the mechanism delivers the simulated +4.5 points of VRAM hit, but decode speed doesn't follow (-2% on
+the short prompt, within noise on the long one). Same lesson as the pool-size sweep (section 4): extra VRAM hits only
+pay when they remove SSD reads, and SSD reads didn't change (26.9/token). The RAM fetches saved (~7/token) mostly
+overlapped the disk wait already. A profile of the cost was started and stopped as inconclusive.
+
+### 6d.8 Round 3 verdict: inconclusive, nothing shipped
+- **No speed gain.** The best state stays split MoE + learned host cache v2 + tail skip 4 at ~11.6 tok/s.
+- **What round 3 established:**
+  - The VRAM policy is within a few points of what any history-based policy can reach.
+  - The router's full scores add only ~1.5 points.
+  - The theoretical-optimum gap is foresight (~10 points) plus randomness (~6), neither reachable online.
+  - **VRAM hit rate is no longer the speed lever:** +4.5 points of hit rate (soft spares) and +1.6 points (a
+    bigger pool) both gave no speedup. Speed tracks SSD reads per token.
+- **Soft spares stay in `exp/score-cache`, off by default,** for anyone revisiting. A profile of their overhead
+  (copy-out waits vs link contention) is the open question.
+- **Where to look next:** fewer SSD reads per token (capacity, or approximate routing like tail skip), or the
+  untested usage-level ideas in 6b.5.
+
 ## 7. A reusable method checklist
 
 1. **Read the code paths and the repo's own "tried" notes** first. Write down the per-token data flow and which
@@ -442,6 +596,8 @@ picture correctly in 15 s.
 
 ## 8. Most promising next steps
 1. **Idle-time re-tiering** between requests and during tool gaps, preemptible (section 6b.5). Untested.
+   Round 3 (section 6d) showed VRAM-hit gains alone don't speed up decoding, so re-tiering is only worth it if it
+   cuts SSD reads (RAM/host tiers), not just VRAM misses.
 2. **A host-cache-aware route kernel.** Expose a "host" bit so the tail skip only drops experts that would really hit
    the SSD.
 3. **Validate tail skip on a broader coding set,** and consider shipping rank 4-6 as an opt-in "fast" mode.

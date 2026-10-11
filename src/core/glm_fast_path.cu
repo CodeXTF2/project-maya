@@ -3393,7 +3393,34 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 rs = ram_victim(R);
                 if (rs >= 0) rc_min = F->cnt[(size_t) R.key[(size_t) rs]];
             }
-            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
+            // learned host cache, mode 2: a RAM victim the host level shadows is not lost by an eviction, so the
+            // VRAM victim always comes down into RAM (VRAM -> RAM -> host, nothing straight back to the SSD)
+            static const bool hl_cascade = [] {
+                const char* v = getenv("STRATA_GLM_HOST_LEARN");
+                return v != nullptr && std::atoi(v) == 2;
+            }();
+            bool shadowed = hl_cascade && F->host_learn && rs >= 0 && R.st[(size_t) rs] == FastState::kRHold &&
+                            R.key[(size_t) rs] >= 0 && F->hc_of[(size_t) R.key[(size_t) rs]] >= 0;
+            if (hl_cascade && F->host_learn && !shadowed && rs >= 0 && R.st[(size_t) rs] != FastState::kRFree &&
+                rc_min >= bc) {
+                // the victim would drop the VRAM expert to the SSD: take the coldest SHADOWED held slot instead
+                int best = -1;
+                uint32_t bcnt = UINT32_MAX;
+                for (int s2 = 0; s2 < R.n; ++s2) {
+                    const int k2 = R.key[(size_t) s2];
+                    if (R.st[(size_t) s2] != FastState::kRHold || k2 < 0 || F->hc_of[(size_t) k2] < 0) continue;
+                    if (F->cnt[(size_t) k2] < bcnt) {
+                        bcnt = F->cnt[(size_t) k2];
+                        best = s2;
+                    }
+                }
+                if (best >= 0) {
+                    rs = best;
+                    rc_min = bcnt;
+                    shadowed = true;
+                }
+            }
+            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc || shadowed)) {
                 if (R.st[(size_t) rs] == FastState::kRHold) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;

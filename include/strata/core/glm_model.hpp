@@ -349,6 +349,7 @@ public:
     bool fast_dsa(int il, int64_t p, std::string& err);     // one DSA mixer (x -> mixer)
     bool fast_moe(int il, bool& pf_pending, std::string& err);   // one MoE FFN (x -> ffn)
     void fast_service();
+    void fast_spill();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[8]);   // LOOKAHEAD

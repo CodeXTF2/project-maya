@@ -191,6 +191,23 @@ struct Glm5Model::FastState {
     void* arena = nullptr;
     size_t arena_bytes = 0;
     // activations (device)
+    // LEARNED HOST CACHE (STRATA_GLM_HOST_LEARN=1): the pageable host cache as an adaptive third level below the
+    // pinned RAM tier - a spill thread shadows the RAM tier's coldest experts into it between boundaries, so what the
+    // boundary evicts from RAM stays one memcpy away instead of going back to the SSD; a hit moves the expert up
+    struct HostSlot {
+        uint8_t* p;
+        size_t cap;
+        int key;   // -1 free, -2 being filled
+    };
+    bool host_learn = false;
+    std::vector<HostSlot> hslot;
+    std::vector<int> hc_of;   // key -> host slot, -1
+    std::thread spill_th;
+    std::mutex spill_mu;
+    std::condition_variable spill_cv;
+    bool spill_go = false, spill_quit = false;
+    std::atomic<bool> spill_pause{false}, spill_busy{false};
+    std::atomic<uint64_t> hl_hits{0}, hl_spills{0}, hl_spill_us{0};
     float* ffn2 = nullptr;     // SPLIT MoE (STRATA_GLM_SPLIT_MOE): the second pass's output (swapped with ffn)
     bool split_moe = false;
     int disk_lane = 0;   // STRATA_GLM_DISK_LANE: disk-only experts computed on the CPU once read (1: never promoted,

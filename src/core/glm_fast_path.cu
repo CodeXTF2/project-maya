@@ -2196,6 +2196,22 @@ bool Glm5Model::fast_warm(std::string& err) {
                 read_slice(sh, off, len, base + J.at + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes));
             });
         }
+        if (const char* hl = getenv("STRATA_GLM_HOST_LEARN"); hl != nullptr && std::atoi(hl) != 0) {
+            F->hc_of.assign((size_t) NL * g.n_expert, -1);
+            for (const HJob& J : hj) {
+                const int key = J.il * g.n_expert + J.e;
+                F->hc_of[(size_t) key] = (int) F->hslot.size();
+                F->hslot.push_back(FastState::HostSlot{base + J.at, F->L[(size_t) J.il].blob, key});
+            }
+            glmfast::g_hc_base = base;   // (freed by host_cache_free; read_slice never serves it: g_hc_ready stays off)
+            glmfast::g_hc_bytes = used;
+            glmfast::g_hc_experts = (int64_t) hj.size();
+            F->host_learn = true;
+            F->spill_th = std::thread([this] { fast_spill(); });
+            std::fprintf(stderr, "glm fast: CUDA%d host cache LEARNED: %zu slots (%.2f GB), the RAM tier's coldest spill "
+                                 "into it\n", dev_, hj.size(), (double) used / 1073741824.0);
+            return true;
+        }
         // the lookup: each expert's three slices under their shard, sorted by offset
         for (const HJob& J : hj) {
             const auto& Ly = F->L[(size_t) J.il];
@@ -2246,6 +2262,19 @@ void Glm5Model::fast_destroy() {
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
     F->workers.reset();
+    if (F->spill_th.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(F->spill_mu);
+            F->spill_quit = true;
+        }
+        F->spill_pause.store(true);
+        F->spill_cv.notify_all();
+        F->spill_th.join();
+    }
+    if (F->host_learn)
+        std::fprintf(stderr, "glm fast diag CUDA%d: learned host cache - %llu hits, %llu spills in %.1f s\n", dev_,
+                     (unsigned long long) F->hl_hits.load(), (unsigned long long) F->hl_spills.load(),
+                     (double) F->hl_spill_us.load() / 1e6);
     glmfast::host_cache_free();
     F->cpu_pool.reset();
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
@@ -2766,10 +2795,40 @@ void Glm5Model::fast_service() {
                     const char* v = getenv("STRATA_GLM_READ_CHUNKS");
                     return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
+                const uint8_t* hsrc[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+                int hslot_of[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+                if (F->host_learn)
+                    for (int r2 = 0; r2 < nr; ++r2) {
+                        const int m = rd[r2], key = il * g.n_expert + ids[mi[m]];
+                        const int hs = F->hc_of[(size_t) key];
+                        if (hs >= 0 && F->hslot[(size_t) hs].key == key) {
+                            hsrc[m] = F->hslot[(size_t) hs].p;
+                            hslot_of[m] = hs;
+                        }
+                    }
                 F->workers->run(nr * 3 * rch, [&](int job) {
                     const int m = rd[job / (3 * rch)], part = job % (3 * rch);
+                    if (hsrc[m] != nullptr) {   // the learned host cache: the same piece by memcpy
+                        const auto& Ly = F->L[(size_t) il];
+                        const int role = part / rch, chunk = part % rch;
+                        const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+                        const size_t ro = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes;
+                        const size_t piece = ((len + (size_t) rch - 1) / (size_t) rch + 4095) & ~(size_t) 4095;
+                        const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
+                        if (c1 > c0) std::memcpy(dst[m] + ro + c0, hsrc[m] + ro + c0, c1 - c0);
+                        return;
+                    }
                     fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);
                 });
+                for (int m = 0; m < nm; ++m)
+                    if (hslot_of[m] >= 0) {
+                        F->hl_hits.fetch_add(1, std::memory_order_relaxed);
+                        if (dst[m] != F->stage[(size_t) m]) {   // it moved up into a RAM slot: exclusive levels
+                            const int key = il * g.n_expert + ids[mi[m]];
+                            F->hslot[(size_t) hslot_of[m]].key = -1;
+                            F->hc_of[(size_t) key] = -1;
+                        }
+                    }
                 for (int i = 0; i < ns; ++i) F->rload[(size_t) cls][(size_t) sl[i]].store(stv[i], std::memory_order_release);
                 if (nw > 0) {
                     const auto tw = std::chrono::steady_clock::now();
@@ -2864,6 +2923,112 @@ void Glm5Model::fast_service() {
         }
         F->processed.fetch_add(1, std::memory_order_release);
         ++next;
+    }
+}
+
+// The LEARNED HOST CACHE's spill thread: after each boundary, shadow the RAM tier's coldest held experts (outside the
+// recency window, no host copy yet) into the host slots that matter least - free ones, ones whose expert is in VRAM or
+// RAM anyway, then the coldest - so the next boundaries' RAM evictions leave them one memcpy away, not on the SSD.
+// The RAM slots' bytes only change at a boundary, which pauses this first; the tables change under F->mu.
+void Glm5Model::fast_spill() {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    static const int per_round = [] {
+        const char* v = getenv("STRATA_GLM_HOST_SPILL");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 64;
+    }();
+    static const uint64_t protect = [] {
+        const char* v = getenv("STRATA_GLM_RAM_PROTECT");
+        return (uint64_t) (v ? std::max(0, std::atoi(v)) : 64) * 42u;
+    }();
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(F->spill_mu);
+            F->spill_cv.wait(lk, [&] { return F->spill_quit || F->spill_go; });
+            if (F->spill_quit) return;
+            F->spill_go = false;
+        }
+        F->spill_busy.store(true);
+        if (F->spill_pause.load()) {
+            F->spill_busy.store(false);
+            continue;
+        }
+        struct Job {
+            const uint8_t* src;
+            int hs, key;
+            size_t len;
+        };
+        std::vector<Job> jobs;
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            std::vector<std::pair<uint32_t, std::pair<int, int>>> cand;   // count, (class, slot)
+            for (size_t c = 0; c < F->rc.size(); ++c) {
+                const auto& R = F->rc[c];
+                for (int s = 0; s < R.n; ++s) {
+                    const int key = R.key[(size_t) s];
+                    if (R.st[(size_t) s] != FastState::kRHold || key < 0 || F->hc_of[(size_t) key] >= 0) continue;
+                    if (R.tick[(size_t) s] + protect > F->clock) continue;
+                    cand.push_back({F->cnt[(size_t) key], {(int) c, s}});
+                }
+            }
+            const size_t nc = std::min<size_t>(cand.size(), (size_t) per_round);
+            std::partial_sort(cand.begin(), cand.begin() + (long) nc, cand.end());
+            cand.resize(nc);
+            // host slots by how little they matter: free / redundant (the expert is in VRAM or RAM) first, then count
+            std::vector<std::pair<uint64_t, int>> hv;
+            for (size_t i = 0; i < F->hslot.size(); ++i) {
+                const int k = F->hslot[i].key;
+                if (k == -2) continue;
+                const bool redundant = k < 0 || F->slot_of[(size_t) k] >= 0 || F->ram_of[(size_t) k] >= 0;
+                hv.push_back({redundant ? 0ull : 1ull + (uint64_t) F->cnt[(size_t) k], (int) i});
+            }
+            std::sort(hv.begin(), hv.end());
+            std::vector<char> taken(F->hslot.size(), 0);
+            size_t hp = 0;
+            for (const auto& cd : cand) {
+                const auto& R = F->rc[(size_t) cd.second.first];
+                const int key = R.key[(size_t) cd.second.second];
+                const size_t len = F->L[(size_t) (key / g.n_expert)].blob;
+                // the least-mattering slot big enough that matters less than this expert
+                int pick = -1;
+                for (size_t j = hp; j < hv.size(); ++j) {
+                    const int h = hv[j].second;
+                    if (taken[(size_t) h] || F->hslot[(size_t) h].cap < len) continue;
+                    if (hv[j].first != 0 && hv[j].first - 1 >= cd.first) break;   // everything left is hotter
+                    pick = h;
+                    if (j == hp) ++hp;
+                    break;
+                }
+                if (pick < 0) continue;
+                taken[(size_t) pick] = 1;
+                const int old = F->hslot[(size_t) pick].key;
+                if (old >= 0 && F->hc_of[(size_t) old] == pick) F->hc_of[(size_t) old] = -1;
+                F->hslot[(size_t) pick].key = -2;
+                jobs.push_back(Job{R.base + (size_t) cd.second.second * R.stride, pick, key, len});
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t done = 0;
+        for (; done < jobs.size(); ++done) {
+            if (F->spill_pause.load()) break;
+            std::memcpy(F->hslot[(size_t) jobs[done].hs].p, jobs[done].src, jobs[done].len);
+        }
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            for (size_t i = 0; i < jobs.size(); ++i) {
+                auto& H = F->hslot[(size_t) jobs[i].hs];
+                if (i < done && F->hc_of[(size_t) jobs[i].key] < 0) {
+                    H.key = jobs[i].key;
+                    F->hc_of[(size_t) jobs[i].key] = jobs[i].hs;
+                } else {
+                    H.key = -1;
+                }
+            }
+        }
+        F->hl_spills.fetch_add(done, std::memory_order_relaxed);
+        F->hl_spill_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        F->spill_busy.store(false);
     }
 }
 
@@ -2997,6 +3162,22 @@ void Glm5Model::fast_ahead_reader() {
 bool Glm5Model::fast_boundary(std::string& err) {
     FastState* F = fast_;
     if (F == nullptr || F->lp.empty() || F->rc.empty()) return true;
+    if (F->host_learn) {   // the spill reads RAM slots this boundary may rewrite: let it stop first
+        F->spill_pause.store(true);
+        while (F->spill_busy.load()) cpu_relax();
+    }
+    struct SpillGo {
+        FastState* F;
+        ~SpillGo() {
+            if (!F->host_learn) return;
+            F->spill_pause.store(false);
+            {
+                std::lock_guard<std::mutex> lk(F->spill_mu);
+                F->spill_go = true;
+            }
+            F->spill_cv.notify_all();
+        }
+    } spill_go{F};
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;

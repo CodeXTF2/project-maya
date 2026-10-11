@@ -177,6 +177,8 @@ struct MoeDev {
     unsigned int* dcnt = nullptr;              // ... [n_keys] routes per key (halved every 4096 routes): the coldest
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
+    unsigned int* miss_bits = nullptr;         // SPLIT MoE: the route's disk-only entries (device copy of miss_mask)
+    unsigned long long* defer_ptr = nullptr;   // ... [8] their planned slots, held back while the others compute
 };
 /// The CPU LANE's answer: the weighted sum of the RAM-tier experts the host computed for route `seq`.
 struct CpuAnswer {
@@ -235,6 +237,10 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
+/// SPLIT MoE: phase 0 (after the route) holds back the disk-only entries' plan slots so the expert kernels skip them;
+/// phase 1 (after moe_wait) brings them back and nulls every other entry (plan and fetch source), so a second
+/// fetch / gate_up / down pass runs the disk-only experts alone.
+void moe_split(const MoeDev& d, int k, int phase, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and

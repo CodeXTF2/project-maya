@@ -2212,6 +2212,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         *a.d.seq = seq;
         s_seq = seq;
         *a.d.wait_seq = mask ? seq : 0u;
+        if (a.d.miss_bits != nullptr) *a.d.miss_bits = mask;
         if (a.d.cpu_seq != nullptr) *a.d.cpu_seq = cpu ? seq : 0u;
         *a.d.cpu_flag = 0;
     }
@@ -2280,6 +2281,26 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
     if (((volatile const MoeResponse*) r)->cpu) {
         for (int e = tid; e < n_embd; e += blockDim.x) d.cpu_part[e] = ((volatile const MoeResponse*) r)->cpu_part[e];
         if (tid == 0) *d.cpu_flag = 1;
+    }
+}
+
+// SPLIT MoE (see moe_split)
+__global__ void moe_split_kernel(MoeDev d, int k, int phase) {
+    const int i = threadIdx.x;
+    if (i >= k) return;
+    const unsigned int m = *d.miss_bits;
+    if (phase == 0) {
+        if ((m >> i) & 1u) {
+            d.defer_ptr[i] = d.plan_ptr[i];
+            d.plan_ptr[i] = 0ull;
+        } else {
+            d.defer_ptr[i] = 0ull;
+        }
+    } else if ((m >> i) & 1u) {
+        d.plan_ptr[i] = d.defer_ptr[i];
+    } else {
+        d.plan_ptr[i] = 0ull;
+        d.fetch_src[i] = 0ull;
     }
 }
 
@@ -3180,6 +3201,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s) {
     moe_wait_kernel<<<1, 256, 0, s>>>(d, n_embd);
     launch_check("moe_wait");
+}
+
+void moe_split(const MoeDev& d, int k, int phase, cudaStream_t s) {
+    moe_split_kernel<<<1, 32, 0, s>>>(d, k, phase);
+    launch_check("moe_split");
 }
 
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s) {

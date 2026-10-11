@@ -191,6 +191,8 @@ struct Glm5Model::FastState {
     void* arena = nullptr;
     size_t arena_bytes = 0;
     // activations (device)
+    float* ffn2 = nullptr;     // SPLIT MoE (STRATA_GLM_SPLIT_MOE): the second pass's output (swapped with ffn)
+    bool split_moe = false;
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
     float* part = nullptr;
     unsigned int* counter = nullptr;

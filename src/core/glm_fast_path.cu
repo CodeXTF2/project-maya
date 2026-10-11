@@ -779,6 +779,19 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: the activation arena overflowed its estimate";
         return false;
     }
+    // SPLIT MoE (STRATA_GLM_SPLIT_MOE=1): a route's VRAM / RAM-tier experts run while the host reads its disk-only
+    // ones; a second pass runs those once they landed (the device parked on the disk with every expert waiting)
+    if (const char* v = getenv("STRATA_GLM_SPLIT_MOE"); v != nullptr && std::atoi(v) != 0) {
+        if (cudaMalloc(&F->ffn2, (size_t) E * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&F->md.miss_bits, 64) != cudaSuccess ||
+            cudaMalloc(&F->md.defer_ptr, 8 * sizeof(unsigned long long)) != cudaSuccess) {
+            err = "glm fast: the split-MoE buffers did not allocate";
+            return false;
+        }
+        cudaMemset(F->md.miss_bits, 0, 64);
+        F->split_moe = true;
+        std::fprintf(stderr, "glm fast: CUDA%d split MoE on (disk-only experts in a second pass)\n", dev_);
+    }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
@@ -2271,6 +2284,9 @@ void Glm5Model::fast_destroy() {
                      dev_, (double) F->pred_overlap.load() / (double) F->pred_n.load(),
                      100.0 * (double) F->pred_miss_hit.load() / (double) std::max<uint64_t>(1, F->pred_miss.load()),
                      (unsigned long long) F->pred_miss.load());
+    std::fprintf(stderr, "glm fast diag CUDA%d: disk reads %llu (%.1f s), host-cache slice hits %llu\n", dev_,
+                 (unsigned long long) F->disk_reads.load(), (double) F->disk_us.load() / 1e6,
+                 (unsigned long long) glmfast::g_hc_hits.load());
     if (F->prof_on && F->ptokens > 0) {
         std::vector<std::pair<double, std::string>> v;
         double tot = 0;
@@ -3526,6 +3542,32 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     if (pf && pf_at == 0) issue_prefetch();
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM
+    // SPLIT: the experts at hand first (VRAM residents and RAM-tier fetches), the disk-only ones after the wait
+    const bool split = F->split_moe && il != mtp_il_;
+    if (split) {
+        gf::moe_split(md, g.n_exp_used, 0, s);
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        if (F->prof_on) F->mark("moe_fetch");
+        if (pf && pf_at == 1) issue_prefetch();
+        if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
+        pf_pending = false;
+        gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq,
+                        Ly.sh_down.q, Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
+        if (F->prof_on) F->mark("moe_gate_up");
+        gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
+                     Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
+        if (F->prof_on) F->mark("moe_down");
+        gf::moe_wait(md, g.n_embd, s);
+        if (F->prof_on) F->mark("moe_wait");
+        gf::moe_split(md, g.n_exp_used, 1, s);
+        gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        if (F->prof_on) F->mark("moe_fetch2");
+        gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, nullptr,
+                        Ly.sh_down.type, F->sh_hq, FFs, nullptr, s);
+        gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq, F->ffn, F->ffn2, s);
+        std::swap(F->ffn, F->ffn2);
+        if (F->prof_on) F->mark("moe_disk_pass");
+    } else {
     gf::moe_wait(md, g.n_embd, s);
     if (F->prof_on) F->mark("moe_wait");
     gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
@@ -3541,6 +3583,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
+    }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked
     if (lane) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);

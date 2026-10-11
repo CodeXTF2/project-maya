@@ -1967,6 +1967,8 @@ struct RouteArgs {
     int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
+    int sub_from, sub_m;        // CACHE-AWARE ROUTE: a disk-only pick at rank >= sub_from is swapped for the best of
+                                // the next sub_m ranks held in VRAM or the RAM tier (sub_m 0: off)
     int disk_skip_from;         // TAIL SKIP: a DISK-ONLY expert at route rank >= this is left out (k: never) ...
     float disk_skip_w;          // ... or whose routing weight is below this (0: never)
 };
@@ -1984,7 +1986,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     const int E = a.n_expert;
     __shared__ float s_p[512], s_sel[512];
-    __shared__ int s_ids[8];
+    __shared__ int s_ids[24];   // the top k (+ sub_m runners-up for the cache-aware route)
     __shared__ float s_w[8];
     __shared__ unsigned int s_mask, s_seq;
     __shared__ int bad;
@@ -2002,7 +2004,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
-    topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    topk_argmax(s_sel, E, a.k + a.sub_m, s_ids, s_bv, s_bi);
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
@@ -2098,6 +2100,24 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ int s_npf, s_pfid[8];
     __shared__ unsigned long long s_pfptr[8];
     if (tid == 0) {
+        if (a.sub_m > 0) {
+            // CACHE-AWARE ROUTE (Skliar et al. 2024, training-free): a low-ranked pick that only the disk holds gives
+            // its place to the best runner-up a faster tier holds; the weights renormalise over the new set below
+            const unsigned long long* rt = a.d.tab + a.d.n_keys;
+            for (int i = a.sub_from; i < a.k; ++i) {
+                const size_t key = (size_t) a.layer * E + s_ids[i];
+                if (a.d.tab[key] != 0ull || rt[key] != 0ull) continue;
+                for (int j = a.k; j < a.k + a.sub_m; ++j) {
+                    const int c = s_ids[j];
+                    if (c < 0 || c >= E) continue;
+                    const size_t ck = (size_t) a.layer * E + c;
+                    if (a.d.tab[ck] == 0ull && rt[ck] == 0ull) continue;
+                    s_ids[i] = c;
+                    s_ids[j] = -1;
+                    break;
+                }
+            }
+        }
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
         const float inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
@@ -3197,7 +3217,19 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
-                pf_rank > 0 ? pf_rank : k, k, 0.0f};
+                pf_rank > 0 ? pf_rank : k, k, 0, k, 0.0f};
+    static const int sub_from = [] {
+        const char* v = std::getenv("STRATA_GLM_SUB_FROM");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 64;
+    }();
+    static const int sub_m = [] {
+        const char* v = std::getenv("STRATA_GLM_SUB_M");
+        return v != nullptr ? std::max(0, std::min(16, std::atoi(v))) : 0;
+    }();
+    if (skip_from >= k && sub_from < k && sub_m > 0) {
+        a.sub_from = sub_from;
+        a.sub_m = std::min(sub_m, n_expert - k);
+    }
     // STRATA_GLM_TAIL_SKIP=<rank> / STRATA_GLM_TAIL_SKIP_W=<weight>: the trunk leaves out disk-only experts at that
     // route rank or later / with a routing weight below that (approximate: no re-normalisation, upstream's rule)
     static const int tail_rank = [] {

@@ -571,6 +571,60 @@ overlapped the disk wait already. A profile of the cost was started and stopped 
 - **Where to look next:** fewer SSD reads per token (capacity, or approximate routing like tail skip), or the
   untested usage-level ideas in 6b.5.
 
+## 6e. Applying the lessons to upstream Strata (2026-10-12)
+
+**Strata on this PC:**
+- Qwen3.8-Flash-Next "Swift" IQ3_XXS, 71 GB; 512 experts, top-10 routing, small experts.
+- **Every expert is resident in RAM**, so there's no SSD in the expert path.
+- The VRAM cache holds 25-29% of the experts at 63-87% hit. It's profile-ranked and re-ranks every 4 windows (decay
+  0.7, at most 96 swaps).
+- Misses split between 11 CPU pool workers and a PCIe share of 0.55.
+- MTP speculation runs at `--spec 4`. Decode was ~65-85 tok/s before this change.
+
+**So, unlike Maya's final state, every miss is on the critical path.**
+
+**What did and didn't transfer** (code survey; file references in the session notes):
+- **Tail skip:** upstream already has it (`STRATA_ROUTE_TAIL_SKIP`). It defaults to 7 on CUDA and on HIP gfx1200/1201
+  only (`generate.cpp:1571-1580`), so it was off on this gfx1100.
+  - **Second trap:** the installed prebuilt engine was **0.1.39** (`engine/BUILD.json`), older than the feature
+    (0.1.42), so the variable was silently ignored.
+  - **Always check the binary's version, not the checkout's.**
+- **Split-MoE-style overlap:** the default PCIe-share copy kernel runs after the hits on the same stream (serialized).
+  `--pcie-mode dma` overlaps it. Untested.
+- **CPU vs PCIe share:** fixed at 0.55 on HIP (the auto re-fit is CUDA-only). Untested.
+- **Cache policy:** windowed re-ranking with an effective memory of ~15-25 tokens, close to the LRFU optimum found in
+  section 6d. Little expected.
+- **Not applicable:** host-cache and SSD ideas (everything is in RAM), and soft spares (no empty spare slots in
+  Strata's design).
+
+**Tail-skip measurement.** Strata v0.1.43 prebuilt, same config, only `STRATA_ROUTE_TAIL_SKIP` varying, the Dijkstra
+prompt, greedy, 384 tokens.
+
+KL method: `STRATA_DUMP_FIRST_LOGITS` gives full next-token logits per request (0.1.43 appends a request number to the
+file name). For each of 128 positions of the rank-off answer, send prompt + answer[:i] and generate 1 token. The engine
+reuses the prefix, so each step is one decode window. **Caveat:** this is per-step KL, which may understate drift that
+accumulates over a long answer.
+
+| Tail skip rank | Decode tok/s | vs off | Draft acceptance | KL mean | KL p95 | Top-1 same |
+|---|---|---|---|---|---|---|
+| off | 79.0, 84.2 | 1.00 | 80.5% | - | - | - |
+| **4** | **99.9, 100.5** | **1.23** | 80.4% | **0.0070** | 0.039 | 98.4% |
+| 3 | 101.9 (1 run) | ~1.25 | 81.2% | not measured | | |
+| 2 | 97.8 (1 run) | ~1.20 | 75.4% | not measured | | |
+
+- **Below rank 4 the gain flattens,** and at rank 2 MTP draft acceptance drops and eats the gain. That's the same
+  knee as Maya.
+- **Rank 4 was locked in:**
+  - v0.1.43 installed in `Strata/engine`; the old engine is kept as `Strata/engine-0.1.39-backup`; the CPU
+    `strata-vision.exe` is carried over.
+  - `STRATA_ROUTE_TAIL_SKIP=4` added to `strata-swift-iq3_xxs.json`'s env; the old config is kept as
+    `.bak-before-tailskip`.
+  - Verified at 101.1 tok/s with the start-up line `STRATA_ROUTE_TAIL_SKIP=4 is ON`.
+- **Lesson:** the knee sits at about the same rank (4) for top-8 and top-10 routing, while the KL at that rank was
+  ~3x lower on Strata. Two reasons:
+  - Strata skips an expert only when every token of the MTP window ranks it low.
+  - Its misses are cheaper (RAM rather than SSD), so the speed curve flattens sooner.
+
 ## 7. A reusable method checklist
 
 1. **Read the code paths and the repo's own "tried" notes** first. Write down the per-token data flow and which

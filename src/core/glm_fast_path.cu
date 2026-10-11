@@ -2557,7 +2557,9 @@ void Glm5Model::fast_service() {
                 if (rf != nullptr) {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
-                    std::fprintf(rf, " %u %u %u\n", fetch, miss, cpu);
+                    std::fprintf(rf, " %u %u %u", fetch, miss, cpu);
+                    for (int i = 0; i < K; ++i) std::fprintf(rf, " %.4f", rq->w[i]);
+                    std::fprintf(rf, "\n");
                 }
             }
             uint64_t nh = 0;

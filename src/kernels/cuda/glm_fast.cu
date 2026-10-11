@@ -1967,6 +1967,8 @@ struct RouteArgs {
     int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
     int pf_rank;                // STRATA_GLM_PREFETCH_RANK: prefetch only the prediction's first pf_rank ranks
+    int disk_skip_from;         // TAIL SKIP: a DISK-ONLY expert at route rank >= this is left out (k: never) ...
+    float disk_skip_w;          // ... or whose routing weight is below this (0: never)
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
@@ -2134,7 +2136,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
-            if (ptr == 0ull && i >= a.skip_from) {
+            if (ptr == 0ull && (i >= a.skip_from ||
+                                (rtab[key] == 0ull && (i >= a.disk_skip_from || w < a.disk_skip_w)))) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
             } else if (ptr == 0ull) {
                 src = rtab[key];
@@ -3194,7 +3197,21 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
-                pf_rank > 0 ? pf_rank : k};
+                pf_rank > 0 ? pf_rank : k, k, 0.0f};
+    // STRATA_GLM_TAIL_SKIP=<rank> / STRATA_GLM_TAIL_SKIP_W=<weight>: the trunk leaves out disk-only experts at that
+    // route rank or later / with a routing weight below that (approximate: no re-normalisation, upstream's rule)
+    static const int tail_rank = [] {
+        const char* v = std::getenv("STRATA_GLM_TAIL_SKIP");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 64;
+    }();
+    static const float tail_w = [] {
+        const char* v = std::getenv("STRATA_GLM_TAIL_SKIP_W");
+        return v != nullptr ? (float) std::atof(v) : 0.0f;
+    }();
+    if (skip_from >= k) {
+        a.disk_skip_from = std::min(k, tail_rank);
+        a.disk_skip_w = tail_w;
+    }
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];

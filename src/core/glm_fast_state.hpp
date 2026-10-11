@@ -193,7 +193,11 @@ struct Glm5Model::FastState {
     // activations (device)
     float* ffn2 = nullptr;     // SPLIT MoE (STRATA_GLM_SPLIT_MOE): the second pass's output (swapped with ffn)
     bool split_moe = false;
-    bool disk_lane = false;   // STRATA_GLM_DISK_LANE: disk-only experts computed on the CPU once read
+    int disk_lane = 0;   // STRATA_GLM_DISK_LANE: disk-only experts computed on the CPU once read (1: never promoted,
+                         // 2: promoted by a copy on dls, off the token's critical path)
+    cudaStream_t dls = nullptr;
+    cudaEvent_t dl_ev = nullptr;
+    bool dl_pending = false;
     std::atomic<uint64_t> dlane_us{0}, dlane_experts{0};
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
     float* part = nullptr;

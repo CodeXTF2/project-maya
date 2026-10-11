@@ -792,7 +792,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->split_moe = true;
         std::fprintf(stderr, "glm fast: CUDA%d split MoE on (disk-only experts in a second pass)\n", dev_);
     }
-    if (const char* v = getenv("STRATA_GLM_DISK_LANE"); v != nullptr && std::atoi(v) != 0) F->disk_lane = true;
+    if (const char* v = getenv("STRATA_GLM_DISK_LANE"); v != nullptr && std::atoi(v) != 0) {
+        F->disk_lane = std::atoi(v);
+        if (F->disk_lane == 2 && (cudaStreamCreateWithFlags(&F->dls, cudaStreamNonBlocking) != cudaSuccess ||
+                                  cudaEventCreateWithFlags(&F->dl_ev, cudaEventDisableTiming) != cudaSuccess)) {
+            err = "glm fast: the disk lane's copy stream did not create";
+            return false;
+        }
+    }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
@@ -2662,7 +2669,7 @@ void Glm5Model::fast_service() {
                 int n_dupd = 0, dupd_key[2 * 8];
                 unsigned long long dupd_val[2 * 8];
                 unsigned int promo_m = promo;
-                if (dlane) {
+                if (dlane && F->disk_lane == 1) {
                     for (int i = 0; i < K; ++i) {
                         if ((((miss & promo_m) >> i) & 1u) == 0) continue;
                         const int key = il * g.n_expert + ids[i];
@@ -2680,6 +2687,10 @@ void Glm5Model::fast_service() {
                             promo_m &= ~(1u << i);
                         }
                     }
+                }
+                if (F->dl_pending) {   // DISK LANE 2: the previous promotion copies read staging - let them land
+                    cudaEventSynchronize(F->dl_ev);
+                    F->dl_pending = false;
                 }
                 int nm = 0, mi[8], nr = 0, rd[8], nw = 0, wt[8], ns = 0, sl[8];
                 uint64_t stv[8];
@@ -2789,6 +2800,20 @@ void Glm5Model::fast_service() {
                                               std::chrono::steady_clock::now() - tc).count(), std::memory_order_relaxed);
                     F->dlane_experts.fetch_add((uint64_t) nm, std::memory_order_relaxed);
                     Rp->cpu = 1;
+                    if (F->disk_lane == 2) {
+                        bool any = false;
+                        for (int m = 0; m < nm; ++m)
+                            if ((promo_m >> mi[m]) & 1u) {
+                                cudaMemcpyAsync((void*) rq->promo_ptr[mi[m]], dst[m], F->L[(size_t) il].blob,
+                                                cudaMemcpyHostToDevice, F->dls);
+                                any = true;
+                            }
+                        if (any) {
+                            cudaEventRecord(F->dl_ev, F->dls);
+                            (void) cudaStreamQuery(F->dls);   // (Windows HIP: submit now)
+                            F->dl_pending = true;
+                        }
+                    }
                     for (int u = 0; u < n_dupd; ++u) {
                         Rp->upd_key[u] = dupd_key[u];
                         Rp->upd_val[u] = dupd_val[u];
@@ -2975,6 +3000,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+    if (F->dls != nullptr && !glmfast::cuda_ok(cudaStreamSynchronize(F->dls), "glm disk-lane copies", err)) return false;
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
